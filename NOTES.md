@@ -2,6 +2,84 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-11-17 QEMU full-userland bring-up (Windows/WSL host) <<<
+
+**STATE:** QEMU `virt` boots the full iPhone10,3 16.7.16 userland (HFS+ root on md0
+RAM disk, ~13.5 GiB) to the **Apple-logo boot splash on the panel**: launchd spawns
+the system daemons, `exec SpringBoard` happens ~00:39 virtual, backboardd opens
+AppleCLCD (`SWEET FB: backboardd sel 15/22/29/33/57 ...`) and does its first swap —
+with `sweetfb_noconsole=1` the kernel console pauses on first swap and fb-live.png
+shows the real iOS boot screen. SpringBoard is alive doing AKS keychain calls
+(`SWEET AKS: SpringBoard sel 0/35/7`). Lock screen not yet observed — still booting
+under TCG (~1 min virtual per ~4-5 min wall without `-d int`). Known benign noise:
+CommCenter on-demand spawn crash-loops (sig 6, its launchd jobs were removed but
+clients still look it up), fairplayd.H2/bluetoothd respawn churn, driverkitd sig 9.
+fbwatch now dedups the circular console into `fb-history.txt` (full boot log).
+
+**The md0 >4 GiB root mount failure (`hfs_mounthfsplus: cat_idlookup returned (22)
+getting rootfolder`) is root-caused and fixed:** `bsd/dev/memdev.c` `mdev[].mdSize`
+is a uint32_t page count, and every `(mdSize << 12)` bound/size computation is done
+in 32 bits -> wraps at 4 GiB -> a 13.5 GiB RAM disk reads as a ~2 GiB device: reads
+>=2 GiB fail EINVAL, `DKIOCGETBLOCKCOUNT` reports 4 MiB sectors, and the HFS+ catalog
+fragmented past 2 GiB (created by Linux mkfs+rsync, extents overflow) dies on first
+lookup. Patch `0082-sweet-memdev-large-ramdisks.patch` casts all of them to uint64_t
+(mdevrw/mdevstrategy/mdevsize-ioctl/mdevgetrange). The 512 MiB test image mounted
+fine because its size did not overflow; small md was never stress-tested upstream.
+- Because the fork CI cannot currently push a working build (see below), the same fix
+  was applied to `xnu/out/kernel.development.sweet` as a **binary patch**
+  (`xnu/out/kernel.development.sweet.mdfix`): ten `lsl/add/sub/udiv/ldr w` sites in
+  _mdevstrategy/_mdevrw/_mdevgetrange/_mdevioctl widened to 64-bit in-place. Verified
+  by disassembly. Use the .patch for any real rebuild.
+
+**QEMU/wiring changes (committed on fork `raab-ing/ios-sweet` `09401e7`):**
+- `tools/mkadt.py`: `--qemu` now emits `QEMU_MEM_SIZE = 0x3c0000000` (15 GiB dram) so
+  a full root fits in topOfKernelData alongside the kernel; `/product` imported from
+  `research/ipsw-x/d22ap.adt` when present (extract with `ipsw img4 im4p extract`).
+- `tools/mkpayload.py`: `--ramdisk` streams the image into the payload in 64 MiB
+  chunks (the old path OOMed at ~30 GiB RSS); `build_file()` writes out/ directly.
+- `tools/qemu-sweet.py`: `build_image(payload_path, out_path)` streams ram.bin;
+  `payload_data()` accepts a path; `-m` is read from the payload header.
+- `tools/fbwatch.py`: live QMP `pmemsave` of the 0x9c000000 panel -> fb-live.png/.txt,
+  plus scroll-dedup of the circular console into `fb-history.txt` (full boot log).
+- `tools/qemu-sweet.py`: `SWEET_QEMU_DEBUG` env overrides the `-d` flags —
+  `SWEET_QEMU_DEBUG=guest_errors,unimp` (drop `int`) gives ~5-8x TCG speedup; `int`
+  tracing produced ~360 MiB log and ~30% speed on the long userland boot.
+
+**Boot recipe (WSL2, qemu-system-aarch64 10.2.1):**
+```
+python3 tools/mkadt.py /root/qemu-full.adt --qemu
+python3 tools/mkpayload.py xnu/out/kernel.development.sweet.mdfix /root/qemu-full.adt \
+  /root/payload-ios3.bin --ramdisk /root/ios-sweet-ipsw/ios16-root.img \
+  --cmdline 'serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 \
+  rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin \
+  launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetfb_noconsole=1'
+SWEET_QEMU_DEBUG=guest_errors,unimp python3 tools/qemu-sweet.py /root/payload-ios3.bin \
+  /root/run-fix3 --secs 14400 --kernel xnu/out/kernel.development.sweet
+python3 tools/fbwatch.py /root/run-fix3 /root/payload-ios3.bin \
+  --kernel xnu/out/kernel.development.sweet --every 4
+```
+Notes: QEMU dirs must be on the WSL-native fs (mon.sock cannot bind on /mnt/f).
+`-noprogress` avoids the watchdog false-positive; do NOT re-add `debug=0xc` (rtclock
+IRQ watchdog trips under TCG timing). `jnl: flushing fs disk buffer returned 0x19`
+is benign (ENOTTY = md has no DKIOCSYNCHRONIZE). `sweetfb_noconsole=1` is what lets
+the panel show UI instead of kernel text (console switches to serial — nonexistent
+on QEMU — after the first swap, so panics after that point are invisible; keep
+fb-history.txt as the log). Without it the UI renders but the console overdraws it.
+
+**Image:** `/root/ios-sweet-ipsw/ios16-root.img` (~15 GiB sparse HFS+ journaled
+case-sensitive, iPhone10,3 20H392 OS+SystemOS+AppOS via `tools/mkiosroot.sh` +
+`tools/sweet-root-tweaks.py`, fsck clean). Host-side mounts need the custom WSL2
+kernel in `~/.wslconfig` (HFS/HFSPLUS built-in) — the stock WSL2 kernel has neither.
+
+**CI blocker (fork):** `runs-on: macos-14` is retired (fully unsupported 2026-11-02);
+macos-15 only ships Xcode 16+ -> `iig` emits IORPC.kernelContent xnu-8796 lacks ->
+the IIG env var can redirect to a vendored/iig-shim if needed (MakeInc.cmd honors a
+pre-set IIG). Pushing workflow-file edits needs gh `workflow` scope, which the
+current token lacks; SSH keys on the host are not registered with GitHub.
+Next agent: `gh auth refresh -s workflow` then change runs-on to macos-15 and deal
+with iig (shim `IIG=` to a wrapper that sed-fixes kernelContent, or check whether
+-k still links the kernel despite DriverKit codegen errors).
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **STATE at end of 2026-10-18 (evening):**

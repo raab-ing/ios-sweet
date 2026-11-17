@@ -306,9 +306,12 @@ def main():
         pf.seek(0x40)
         mem_size = struct.unpack('<Q', pf.read(8))[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
+    # '-d int' traces every exception and roughly halves TCG speed on a long
+    # userland boot; keep it for kernel bring-up, drop it via SWEET_QEMU_DEBUG.
+    qdebug = os.environ.get('SWEET_QEMU_DEBUG', 'int,guest_errors,unimp')
     cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
-           '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
+           '-d', qdebug, '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
