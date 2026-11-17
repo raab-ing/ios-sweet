@@ -257,6 +257,7 @@ def main():
     ap.add_argument('--gdb', action='store_true', help='start halted, gdb stub on :1234, no timeout')
     ap.add_argument('--hmp', action='append', default=[], help='extra monitor command run after stop (repeatable), e.g. "x /8gx 0xfffffe..."')
     ap.add_argument('--cpu', default='cortex-a76', help='QEMU CPU model (default: cortex-a76)')
+    ap.add_argument('--smp', type=int, default=1, help='vCPU count; N>1 uses sockets=N,cores=1 so MPIDR Aff1=i, matching the ADT reg=i<<8 cpu nodes')
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
@@ -309,7 +310,10 @@ def main():
     # '-d int' traces every exception and roughly halves TCG speed on a long
     # userland boot; keep it for kernel bring-up, drop it via SWEET_QEMU_DEBUG.
     qdebug = os.environ.get('SWEET_QEMU_DEBUG', 'int,guest_errors,unimp')
-    cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
+    # sockets=N,cores=1 puts the vCPU index in MPIDR Aff1 (i<<8), the layout
+    # mkadt emits in reg= and the kernel's SweetCPU nubs match on.
+    smp = f'sockets={a.smp},cores=1,threads=1' if a.smp > 1 else '1'
+    cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', smp, '-m', f'{ram_gib}G',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', qdebug, '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',

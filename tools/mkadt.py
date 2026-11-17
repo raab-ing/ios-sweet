@@ -77,10 +77,10 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, qemu_cpus=1, qemu_mem=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem \
-        else ((PHYS_BASE, QEMU_MEM_SIZE) if qemu else (PHYS_BASE, MEM_SIZE))
+        else ((PHYS_BASE, qemu_mem or QEMU_MEM_SIZE) if qemu else (PHYS_BASE, MEM_SIZE))
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
@@ -136,14 +136,16 @@ def build(seed=None, qemu=False, highmem=False):
     # SWEET SMP: all eight cores in physical-core order (0-5 Cortex-A55,
     # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
     # and uses cpus=N to select an initial prefix (N <= 8).
-    # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
+    # QEMU: reg/phys_id is i<<8, which matches virt's MPIDRs only when QEMU is
+    # run -smp sockets=N,cores=1 (socket index lands in Aff1). qemu-sweet.py
+    # --smp N does exactly that.
     cpu_nodes = []
-    for core in range(1 if qemu else 8):
+    for core in range(qemu_cpus if qemu else 8):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            ('reg', u32(core if qemu else core << 8)),  # MPIDR (virt: Aff0=i; sweet: Aff1=i), NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
@@ -246,7 +248,13 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    qc = 1
+    if '--qemu-cpus' in sys.argv:
+        qc = int(sys.argv[sys.argv.index('--qemu-cpus') + 1])
+    qm = None
+    if '--qemu-mem' in sys.argv:
+        qm = int(sys.argv[sys.argv.index('--qemu-mem') + 1], 0)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, qemu_cpus=qc, qemu_mem=qm)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

@@ -16,6 +16,41 @@ CommCenter on-demand spawn crash-loops (sig 6, its launchd jobs were removed but
 clients still look it up), fairplayd.H2/bluetoothd respawn churn, driverkitd sig 9.
 fbwatch now dedups the circular console into `fb-history.txt` (full boot log).
 
+**SMP (6 vCPUs) now WORKS under QEMU — ~10-20x faster boot.** Three binary patches
+on `kernel.development.sweet.mdfix` -> `kernel.development.sweet.mdfix.smp`:
+1. `SweetCPU::start` topology check @0xfffffe0007a63f68 `and w9,w8,#0xff` ->
+   `mov w9,wzr`: QEMU virt MPIDRs are bare Aff0 `reg=<i>` (FDT `cpu@i reg=<i>`, QMP
+   `mp-affinity=0..5`), not the phone's Aff1 `i<<8`. Keeps the `phys_id<=0x700` bound.
+2. `SweetCPU::startCPU` @0xfffffe0007a6463c `smc #0` -> `hvc #0`: QEMU virt has no
+   EL3 — its FDT `psci{method="hvc"}`, so `smc` traps as an *undefined instruction*
+   (panic `instr=d4000003 @sleh.c:951`), it does NOT return a PSCI error. QEMU
+   accepts CPU_ON64 `0xc4000003` over HVC identically.
+3. `hw_spin_should_keep_spinning` @0xfffffe0007340230 -> `mov w0,#1; ret`: under TCG
+   the virtual timebase runs at real-time speed while instructions execute ~30x
+   slower, so any contested ticket lock (e.g. scheduler runqueue in thread_setrun)
+   blows its deadline -> `_hw_lck_ticket_timeout_panic` on a random CPU. Disabling
+   the timeout (spin forever) is correct for QEMU; a real deadlock would hang instead.
+   13 call sites, covered by the function-head patch.
+ADT: `tools/mkadt.py --qemu --qemu-cpus 6` emits `reg=<i>` CPU nodes (changed from
+`i<<8`) and a new `--qemu-mem` override. Boot: `qemu-sweet.py --smp 6` -> `-smp
+sockets=6,cores=1` (MPIDRs still end up Aff0 form — matching the ADT). QEMU guest
+with `-nographic` MUST have `-serial file:`/`none`, else the dead stdio pipe SIGPIPEs
+the backgrounded process. Panic log lives at `phys_base+mem_size-0x100000`; dump via
+native QMP `pmemsave` (HMP pmemsave chokes on `/` in paths).
+Result: all 6 cores online, launchd->backboardd->SpringBoard in ~2.5 min virtual /
+~4 min wall (was ~5+ min virtual / ~30+ min wall single-CPU). Reached `SWEET FB:
+display on`, Apple logo on panel. Lock screen still booting.
+
+**Live kernel log under sweetfb_noconsole=1:** `sweet_log_ring` (0047) is a 4 MiB
+static ring in kernel BSS; `sweet_log_total` counts bytes appended — console text
+still lands there while muted. Read it over QMP: PA = VA - virt_base + phys_base
+(payload hdr 0x10/0x38; for ios4 VA->PA = VA - 0xfffffe0006000000 + 0xb0000000):
+`sweet_log_total`@0xb1c52710, ring@0xb1c52718. pmemsave both, linearize
+`ring[i%4MiB]` for i in [max(0,total-4MiB), total) -> full live dmesg while the
+panel shows UI. Same trick works for any symbol: PA = nmVA - 0xfffffe0006000000 +
+0xb0000000. All 6 CPUs confirmed busy/varied (not deadlocked) via repeated
+`info registers` after `cpu N` switching.
+
 **The md0 >4 GiB root mount failure (`hfs_mounthfsplus: cat_idlookup returned (22)
 getting rootfolder`) is root-caused and fixed:** `bsd/dev/memdev.c` `mdev[].mdSize`
 is a uint32_t page count, and every `(mdSize << 12)` bound/size computation is done
@@ -79,6 +114,56 @@ current token lacks; SSH keys on the host are not registered with GitHub.
 Next agent: `gh auth refresh -s workflow` then change runs-on to macos-15 and deal
 with iig (shim `IIG=` to a wrapper that sed-fixes kernelContent, or check whether
 -k still links the kernel despite DriverKit codegen errors).
+
+### >>> UPDATE 2026-11-17 (later same day — SpringBoard thread forensics) <<<
+
+**SpringBoard is ALIVE and initializing, not deadlocked.** Walked its task/thread
+list over QMP on the smp6 boot: 5 -> 12 threads while watched = GCD/libdispatch
+still spinning up. Continuations: `_workq_unpark_continue` (idle workers),
+`_thread_preempted` (runnable mid-work), `_ipc_mqueue_receive_continue`, plus
+`ulock_wait`(515)/`workq_kernreturn`(368) syscall stubs — all normal blocked
+states. No lock-deadlock, no panic. The slow part is TCG speed, not a hang.
+
+**Kernel offsets for QMP forensics (xnu-8796, dev kernel):**
+- `proc->task`: proc is NOT a combined alloc here — `p_proc_ro`@proc+0x18,
+  `*(proc_ro+8)` = `pr_task` (task). `p_pid`@proc+0x58, `p_comm`@proc+0x5c0.
+- `task->threads`: `queue_head_t` at task+0x80 (next/prev). Entries are thread
+  BASE pointers; `task_threads.next` at thread+0x478. `task->map` at +0x50,
+  `task->mach_header_vm_address` at +0x600.
+- `find_user_regs(th)` = `*(th+0x110)` -> `arm_saved_state64`: x0..x29 then
+  fp@+0xf0 lr@+0xf8 sp@+0x100 pc@+0x108 cpsr@+0x110 (saved x16/x17 are
+  kernel-scratch, NOT the trap args — the trap # is in the stub's mov, read the
+  code at pc-4 via QMP `x` — shared-cache VAs resolve through any ASID).
+- `thread+0xd8` = `thread_continue_t continuation` — symbolicating it names the
+  exact blocked state (workq_unpark/thread_preempted/ipc_mqueue_receive/...).
+- `saved.receive.*` (ith_object/ith_receiver_name/ith_msg_addr) inside the
+  thread struct = which port a mach_msg-blocked thread waits on — decode via
+  `struct thread` line ~620 in osfmk/kern/thread.h.
+- `pmap` layout: `tte`@+0 (KVA of root table), `ttep`@+8 (PA), `min`@+0x10,
+  `max`@+0x18 — my read showed KVA-ish entries, so the walk needs checking
+  (map+0x38 confirmed as pmap via nentries@0x30=0x72, page_shift@0x34=0xe).
+- `_allproc`@0xfffffe0007bfc540; walk: p=p_list.next@+0 until back to &allproc.
+- QMP: `x` = virtual (through current CPU's page tables — kernel VAs always
+  work; a private user VA only resolves if that process is the running ASID);
+  `xp` = physical (ring buffer at PA 0xb1c52710 works regardless).
+
+**The `sweetsample` sampler NEVER runs under QEMU** — `sweet_sample_start()` is
+called from `sweet_ufs`'s disk-attach path (patch 0054), which only fires for a
+real UFS device. Our rd=md0 RAM disk never attaches it -> no `SMP ---` lines.
+To enable it on QEMU either move the call to a boot-arg/unconditional init path
+or trigger it from another always-on driver. Thread-state walking (above) is a
+working substitute meanwhile.
+
+**`-d int` tracing was silently re-enabled on the last smp6 run** (default in
+qemu-sweet.py). qemu.log hit 2.4 GiB; restarted with
+`SWEET_QEMU_DEBUG=guest_errors,unimp` — boot to SpringBoard+10 threads+8 swaps
+in ~8 min wall (vs ~50+ min with int). ALWAYS drop `int` for userland runs.
+
+**New tool `tools/sbmon.py <mon.sock>`:** every 60 s prints SpringBoard's task/
+thread count (walks `_allproc` fresh each tick — survives reboots), kernel-log
+byte total, max `SWEET FB: swap N`, and fb-live.png hash. Usage:
+`setsid nohup python3 tools/sbmon.py /root/run-smp6/mon.sock > run/sbmon.log 2>&1 &`
+(setsid required — plain nohup dies with the WSL shell).
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
