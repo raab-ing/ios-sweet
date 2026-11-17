@@ -193,14 +193,79 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     return bytes(out), info
 
 
+def build_file(kernel_path, adt_path, cmdline, ramdisk_path, out_path):
+    """Like build(), but writes OUT directly: the ramdisk is streamed, not read."""
+    buf = bytearray(open(kernel_path, 'rb').read())
+    m = parse_macho(buf)
+    nfix = apply_chained_fixups(buf, m)
+    segs = [s for s in m['segs'] if s['vmsize']]
+    text = m['segs'][0]
+    assert text['name'] == '__TEXT' and text['fileoff'] == 0
+    virt_base = text['vmaddr'] & ~(0x2000000 - 1)
+    kernel_end = max(s['vmaddr'] + s['vmsize'] for s in segs)
+    kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
+
+    adt_blob = open(adt_path, 'rb').read()
+    PHYS_BASE, MEM_SIZE = adt_dram(adt_blob)
+    ramdisk = None
+    pieces = [(s['vmaddr'], s['vmsize'], buf[s['fileoff']:s['fileoff'] + s['filesize']], None)
+              for s in segs]
+    if ramdisk_path:
+        image_size = os.path.getsize(ramdisk_path)
+        rd_size = (image_size + PAGE - 1) & ~(PAGE - 1)
+        rd_va = kernel_end
+        kernel_end = rd_va + rd_size
+        rd_pa = rd_va - virt_base + PHYS_BASE
+        pieces.append((rd_va, rd_size, None, ramdisk_path))
+        adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
+        ramdisk = (hex(rd_pa), hex(rd_size))
+
+    hdr_size = SEG_TABLE + 32 * len(pieces)
+    out = open(out_path, 'wb')
+    out.write(b'\0' * hdr_size)		# patched once segment offsets are known
+    seg_table = []
+    for vmaddr, vmsize, data, src in pieces:
+        off = out.tell()
+        fsize = 0
+        if src is None:
+            out.write(data)
+            fsize = len(data)
+        else:
+            with open(src, 'rb') as f:
+                while chunk := f.read(64 << 20):
+                    out.write(chunk)
+                    fsize += len(chunk)
+        out.write(b'\0' * (-out.tell() & 0xf))
+        seg_table.append((vmaddr, vmsize, off, fsize))
+    adt_off = out.tell()
+    out.write(adt_blob)
+    out.write(b'\0' * (-out.tell() & 0xf))
+
+    head = bytearray(hdr_size)
+    struct.pack_into('<8sII', head, 0, b'SWEETXNU', 1, len(pieces))
+    struct.pack_into('<7Q', head, 0x10, virt_base, m['entry'], adt_off, len(adt_blob), kernel_end,
+                     PHYS_BASE, MEM_SIZE)
+    cl = cmdline.encode()[:BOOT_LINE_LENGTH - 1]
+    head[CMDLINE:CMDLINE + len(cl)] = cl
+    for i, t in enumerate(seg_table):
+        struct.pack_into('<4Q', head, SEG_TABLE + 32 * i, *t)
+    out.seek(0)
+    out.write(head)
+    out.close()
+    info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
+                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk,
+                size=os.path.getsize(out_path),
+                segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
+    return info
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
-    open(a.out, 'wb').write(blob)
+    info = build_file(a.kernel, a.adt, a.cmdline, a.ramdisk, a.out)
     for k, v in info.items():
         if k != 'segs':
             print(f'{k}: {v}')

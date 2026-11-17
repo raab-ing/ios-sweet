@@ -38,6 +38,9 @@ VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
+# QEMU dram size: big enough to hold a full iOS root as a --ramdisk payload
+# segment inside topOfKernelData (kernel ~0x25M + image + adt + boot_args).
+QEMU_MEM_SIZE = 0x3c0000000
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -76,7 +79,8 @@ def node(name, props=(), children=()):
 
 def build(seed=None, qemu=False, highmem=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem \
+        else ((PHYS_BASE, QEMU_MEM_SIZE) if qemu else (PHYS_BASE, MEM_SIZE))
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
